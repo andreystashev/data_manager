@@ -138,6 +138,9 @@ The `trim_parquet.py` module provides ROS2-independent trimming:
 - **Debug Panel**: View logs and system status (collapsible)
 - **Dark/Light Themes**: Toggle for comfortable viewing
 
+<img width="1438" height="776" alt="Screenshot 2026-06-25 at 12 28 13 AM" src="https://github.com/user-attachments/assets/cde67ddd-5d4e-4af5-a6b2-6148dbd5edcd" />
+
+
 ## Deployment
 
 ```bash
