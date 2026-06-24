@@ -1,0 +1,37 @@
+rosbag2_bagMetadataV5:
+  version: 5
+  storage_identifier: sqlite3
+  relative_file_paths:
+    - 0000.mcap
+    - 0001.mcap
+  duration:
+    nanoseconds: 60000000000
+  starting_time:
+    sec: 1705315800
+    nsec: 0
+  message_count: 8450
+  topics:
+    /sensor/camera/image_raw:
+      topic_type: sensor_msgs/msg/Image
+      serialization_format: cdr
+      offered_qos_profiles: "transient_local"
+      message_count: 3200
+    /sensor/lidar/points:
+      topic_type: sensor_msgs/msg/PointCloud2
+      serialization_format: cdr
+      offered_qos_profiles: "transient_local"
+      message_count: 2100
+    /sensor/radar/objects:
+      topic_type: autoware_perception_msgs/msg/TrackedObjects
+      serialization_format: cdr
+      offered_qos_profiles: "transient_local"
+      message_count: 2150
+    /tf:
+      topic_type: tf2_msgs/msg/TFMessage
+      serialization_format: cdr
+      offered_qos_profiles: "transient_local"
+      message_count: 1000
+  compression_format: ""
+  compression_mode: ""
+  relative_metadata_file_paths:
+    - metadata.yaml

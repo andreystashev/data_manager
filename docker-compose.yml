@@ -1,0 +1,46 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: datamanager-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/minio_data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  datamanager:
+    build: .
+    container_name: datamanager-app
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    volumes:
+      - ~/:/home/appuser/host_home
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_BUCKET: ${S3_BUCKET:-demo-datasets}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      DOWNLOAD_BASE: /home/appuser/host_home/work_folder
+      DOWNLOAD_DISPLAY: ~/work_folder
+      HOST_HOME_MOUNT: /home/appuser/host_home
+      HOME: /home/appuser
+    restart: unless-stopped
+
+volumes:
+  minio_data:

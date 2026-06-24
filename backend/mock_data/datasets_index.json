@@ -1,0 +1,42 @@
+[
+  {
+    "filename": "2024-01-15-vehicle001-morning_drive",
+    "year": 2024,
+    "month": 1,
+    "day": 15,
+    "device_id": "vehicle001",
+    "timestamp": "2024-01-15T08:30:00Z"
+  },
+  {
+    "filename": "2024-01-16-vehicle002-urban_nav",
+    "year": 2024,
+    "month": 1,
+    "day": 16,
+    "device_id": "vehicle002",
+    "timestamp": "2024-01-16T14:20:00Z"
+  },
+  {
+    "filename": "2024-01-17-vehicle003-highway_test",
+    "year": 2024,
+    "month": 1,
+    "day": 17,
+    "device_id": "vehicle003",
+    "timestamp": "2024-01-17T10:15:00Z"
+  },
+  {
+    "filename": "2024-01-18-vehicle001-evening_run",
+    "year": 2024,
+    "month": 1,
+    "day": 18,
+    "device_id": "vehicle001",
+    "timestamp": "2024-01-18T18:45:00Z"
+  },
+  {
+    "filename": "2024-01-19-vehicle002-parking_lot",
+    "year": 2024,
+    "month": 1,
+    "day": 19,
+    "device_id": "vehicle002",
+    "timestamp": "2024-01-19T16:30:00Z"
+  }
+]
