@@ -16,7 +16,7 @@ from pydantic import BaseModel
 import boto3
 from botocore.config import Config
 
-from trim_parquet import trim_bag, reindex_metadata
+from trim_parquet import trim_bag, select_sensor_categories
 from download_state import read_state, save_state, mark_complete, is_complete
 
 # --- Configuration ---
@@ -386,81 +386,6 @@ def _parse_metadata_yaml(yaml_text: str) -> dict:
 
 _dl_cancel = threading.Event()
 
-def _inject_oneshot_from_zero(dest_dir: Path):
-    """Extract one-shot topics from _0.parquet into the first data file, then delete _0.
-
-    Needed when downloading LCR categories without O:
-    _0.parquet has all topics (including unwanted ones), but we need the one-shot
-    topics (maps, tf_static, route) for autoware to initialize.
-    """
-    import pyarrow.parquet as pq
-    from trim_parquet import ONESHOT_TOPICS, DATA_SCHEMA
-
-    zero_files = [f for f in dest_dir.iterdir() if f.name.endswith("_0.parquet") and "_topics" not in f.name]
-    if not zero_files:
-        return
-
-    zero_file = zero_files[0]
-    topics_file = next((f for f in dest_dir.iterdir() if f.name.endswith("_topics.parquet")), None)
-    if not topics_file:
-        return
-
-    # Get one-shot topic IDs
-    tt = pq.read_table(topics_file)
-    oneshot_ids = set()
-    for tid, name in zip(tt.column("topic_id").to_pylist(), tt.column("topic_name").to_pylist()):
-        if name in ONESHOT_TOPICS:
-            oneshot_ids.add(tid)
-
-    if not oneshot_ids:
-        zero_file.unlink()
-        return
-
-    # Extract one-shot rows from _0
-    import pyarrow as pa
-    zero_table = pq.read_table(zero_file).cast(DATA_SCHEMA)
-    tid_col = zero_table.column("topic_id")
-    mask = pa.array([t.as_py() in oneshot_ids for t in tid_col])
-    oneshot_rows = zero_table.filter(mask)
-
-    if len(oneshot_rows) == 0:
-        zero_file.unlink()
-        return
-
-    # Find first non-zero data file to inject into
-    import re as _re
-    data_files = []
-    for f in dest_dir.iterdir():
-        m = _re.search(r'_(\d+)\.parquet$', f.name)
-        if m and "_topics" not in f.name and f != zero_file:
-            data_files.append((int(m.group(1)), f))
-    data_files.sort()
-
-    if not data_files:
-        zero_file.unlink()
-        return
-
-    first_file = data_files[0][1]
-    first_table = pq.read_table(first_file).cast(DATA_SCHEMA)
-
-    # Set one-shot timestamps to just before the first real message
-    ts_col = first_table.column("timestamp")
-    first_ts = ts_col[0].as_py() if len(first_table) > 0 else 0
-    n = len(oneshot_rows)
-    fake_ts = pa.array([first_ts - n + i for i in range(n)], type=pa.int64())
-    oneshot_rows = oneshot_rows.set_column(
-        oneshot_rows.schema.get_field_index("timestamp"), "timestamp", fake_ts,
-    )
-
-    merged = pa.concat_tables([oneshot_rows, first_table])
-    new_ids = pa.array(range(len(merged)), type=pa.uint32())
-    merged = merged.set_column(merged.schema.get_field_index("id"), "id", new_ids)
-    pq.write_table(merged, first_file, compression="snappy", row_group_size=1000, use_dictionary=False)
-
-    zero_file.unlink()
-    logger.info(f"[oneshot] Injected {n} one-shot rows into {first_file.name}, deleted {zero_file.name}")
-
-
 def _rename_for_ros2(dest_dir: Path, old_prefix: str, new_prefix: str):
     """Rename parquet files so ROS2 parquet plugin can find them by folder name."""
     if old_prefix == new_prefix:
@@ -687,10 +612,8 @@ def _dl_worker():
         else:
             suffix = _build_folder_suffix(params)
             has_lcro = any(params.get(c) for c in ["lidars", "cameras", "radars", "other"])
-            has_lcr_no_other = (
-                any(params.get(c) for c in ["lidars", "cameras", "radars"])
-                and not params.get("other")
-            )
+            selected_categories = {cat for cat in ["lidars", "cameras", "radars", "other"]
+                                   if params.get(cat)}
 
             try:
                 # Errors in renaming/trimming must not produce a completed task.
@@ -703,13 +626,13 @@ def _dl_worker():
                 if has_lcro and trim_start is not None and trim_end is not None and start_sec is not None:
                     _update_queue_item(item_id, current_file="trimming...")
                     result = trim_bag(str(dest_dir), int((start_sec + trim_start) * 1e9),
-                                      int((start_sec + trim_end) * 1e9))
+                                      int((start_sec + trim_end) * 1e9),
+                                      selected_categories=selected_categories)
                     if "error" in result:
                         raise ValueError(result["error"])
                     logger.info(f"[dl-worker] trim done for {dataset_name}: {result}")
-                elif has_lcr_no_other:
-                    _inject_oneshot_from_zero(dest_dir)
-                    result = reindex_metadata(dest_dir)
+                elif has_lcro and len(selected_categories) < 4:
+                    result = select_sensor_categories(str(dest_dir), selected_categories)
                     if "error" in result:
                         raise ValueError(result["error"])
 
