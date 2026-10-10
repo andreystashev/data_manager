@@ -16,7 +16,8 @@ from pydantic import BaseModel
 import boto3
 from botocore.config import Config
 
-from trim_parquet import trim_bag
+from trim_parquet import trim_bag, reindex_metadata
+from download_state import read_state, save_state, mark_complete, is_complete
 
 # --- Configuration ---
 
@@ -462,16 +463,22 @@ def _inject_oneshot_from_zero(dest_dir: Path):
 
 def _rename_for_ros2(dest_dir: Path, old_prefix: str, new_prefix: str):
     """Rename parquet files so ROS2 parquet plugin can find them by folder name."""
-    renamed = 0
-    for f in dest_dir.iterdir():
-        if f.name.startswith(old_prefix) and f.suffix == ".parquet":
-            f.rename(dest_dir / (new_prefix + f.name[len(old_prefix):]))
-            renamed += 1
+    if old_prefix == new_prefix:
+        return
+    names = {}
+    for f in list(dest_dir.iterdir()):
+        if (f.is_file() and f.name.startswith(old_prefix + "_")
+                and not f.name.startswith(new_prefix + "_") and f.suffix == ".parquet"):
+            new_name = new_prefix + f.name[len(old_prefix):]
+            f.rename(dest_dir / new_name)
+            names[f.name] = new_name
     meta = dest_dir / "metadata.yaml"
-    if meta.exists():
+    if meta.exists() and names:
         text = meta.read_text(encoding="utf-8")
-        meta.write_text(text.replace(old_prefix, new_prefix), encoding="utf-8")
-    logger.info(f"[rename] {dest_dir.name}: renamed {renamed} files")
+        for old_name, new_name in names.items():
+            text = text.replace(old_name, new_name)
+        meta.write_text(text, encoding="utf-8")
+    logger.info(f"[rename] {dest_dir.name}: renamed {len(names)} files")
 
 def _resolve_keys(dataset_name: str, params: dict) -> tuple:
     with _lock:
@@ -504,7 +511,7 @@ def _resolve_keys(dataset_name: str, params: dict) -> tuple:
             meta = _parse_metadata_yaml(yaml_text)
             trim_file_set = set()
             for f in meta["files"]:
-                if f["start_sec"] < abs_end and f["end_sec"] > abs_start:
+                if f["start_sec"] <= abs_end and f["end_sec"] >= abs_start:
                     trim_file_set.add(f["path"])
 
             # Always include _0 parquet (one-shot topics: maps, tf_static, route)
@@ -512,7 +519,6 @@ def _resolve_keys(dataset_name: str, params: dict) -> tuple:
                 for f in meta["files"]:
                     if f["path"].endswith("_0.parquet"):
                         trim_file_set.add(f["path"])
-                        break
 
             logger.info(f"[resolve] Trim: {len(trim_file_set)}/{len(meta['files'])} parquets match")
         except Exception as e:
@@ -594,7 +600,7 @@ def _dl_worker():
                     params["trimEnd"] = abs_end - start_sec
                     params["startSec"] = start_sec
                 except Exception as e:
-                    logger.warning(f"[dl-worker] could not resolve timeRangeHint for {dataset_name}: {e}")
+                    raise ValueError(f"Could not recover trim window for {dataset_name}: {e}") from e
                 params.pop("timeRangeHint", None)
 
             if stored_keys:
@@ -607,6 +613,7 @@ def _dl_worker():
                 keys_to_dl, dest_dir, host_dest = _resolve_keys(dataset_name, params)
                 _update_queue_item(item_id, keys=keys_to_dl)
             dest_dir.mkdir(parents=True, exist_ok=True)
+            save_state(dest_dir, dataset_name, params, keys_to_dl)
         except Exception as e:
             _update_queue_item(item_id, status="error", error_msg=str(e))
             logger.error(f"[dl-worker] resolve failed for {dataset_name}: {e}")
@@ -685,40 +692,37 @@ def _dl_worker():
                 and not params.get("other")
             )
 
-            if suffix and has_lcro:
-                _rename_for_ros2(dest_dir, dataset_name, dataset_name + suffix)
+            try:
+                # Errors in renaming/trimming must not produce a completed task.
+                if suffix and has_lcro:
+                    _rename_for_ros2(dest_dir, dataset_name, dataset_name + suffix)
 
-            trim_start = params.get("trimStart")
-            trim_end = params.get("trimEnd")
-            start_sec = params.get("startSec")
-            if has_lcro and trim_start is not None and trim_end is not None and start_sec is not None:
-                try:
+                trim_start = params.get("trimStart")
+                trim_end = params.get("trimEnd")
+                start_sec = params.get("startSec")
+                if has_lcro and trim_start is not None and trim_end is not None and start_sec is not None:
                     _update_queue_item(item_id, current_file="trimming...")
-                    trim_start_ns = int((start_sec + trim_start) * 1e9)
-                    trim_end_ns = int((start_sec + trim_end) * 1e9)
-                    result = trim_bag(str(dest_dir), trim_start_ns, trim_end_ns)
+                    result = trim_bag(str(dest_dir), int((start_sec + trim_start) * 1e9),
+                                      int((start_sec + trim_end) * 1e9))
+                    if "error" in result:
+                        raise ValueError(result["error"])
                     logger.info(f"[dl-worker] trim done for {dataset_name}: {result}")
-                except Exception as e:
-                    logger.error(f"[dl-worker] trim failed for {dataset_name}: {e}")
-            elif has_lcr_no_other:
-                try:
+                elif has_lcr_no_other:
                     _inject_oneshot_from_zero(dest_dir)
-                except Exception as e:
-                    logger.error(f"[dl-worker] oneshot inject failed for {dataset_name}: {e}")
+                    result = reindex_metadata(dest_dir)
+                    if "error" in result:
+                        raise ValueError(result["error"])
 
-            _update_queue_item(item_id, status="done", current_file="")
-            logger.info(f"[dl-worker] done {dataset_name} ({downloaded} dl, {skipped} skip, {error_count} err)")
+                mark_complete(dest_dir)
+            except Exception as e:
+                _update_queue_item(item_id, status="error", current_file="", error_msg=str(e))
+                logger.exception(f"[dl-worker] finalization failed for {dataset_name}")
+            else:
+                _update_queue_item(item_id, status="done", current_file="", error_msg=None)
+                logger.info(f"[dl-worker] done {dataset_name} ({downloaded} dl, {skipped} skip, {error_count} err)")
         _dl_cancel.clear()
 
 # --- Recovery ---
-
-def _is_trimmed_complete(folder: Path, dataset_name: str, suffix: str) -> bool:
-    """True if folder has renamed parquets (download+trim+rename finished)."""
-    renamed_prefix = dataset_name + suffix
-    for f in folder.iterdir():
-        if f.name.startswith(renamed_prefix) and f.suffix == ".parquet":
-            return True
-    return False
 
 def _recover_incomplete_downloads():
     """Scan DOWNLOAD_BASE for dataset folders, add to queue (no S3 calls)."""
@@ -731,11 +735,12 @@ def _recover_incomplete_downloads():
         if not entry.is_dir():
             continue
 
+        state = read_state(entry)
         parsed = _parse_folder_suffix(entry.name)
-        if not parsed:
+        if not parsed and not state:
             continue
 
-        dataset_name = parsed["dataset_name"]
+        dataset_name = state["dataset_name"] if state else parsed["dataset_name"]
 
         # Skip if already in queue
         with _lock:
@@ -743,15 +748,14 @@ def _recover_incomplete_downloads():
         if already:
             continue
 
-        suffix = entry.name[len(dataset_name):]  # e.g. "_OTM_203537-203620" or ""
-        has_lcro = any(parsed["cats"].get(c) for c in ["lidars", "cameras", "radars", "other"])
+        if state:
+            params = state["params"]
+        else:
+            params = dict(parsed["cats"])
+            if parsed.get("time_range"):
+                params["timeRangeHint"] = list(parsed["time_range"])
 
-        params = {cat: enabled for cat, enabled in parsed["cats"].items()}
-        time_range = parsed.get("time_range")
-        if time_range:
-            params["timeRangeHint"] = list(time_range)
-
-        if suffix and has_lcro and _is_trimmed_complete(entry, dataset_name, suffix):
+        if is_complete(entry):
             status = "done"
             error_msg = None
         else:
@@ -766,7 +770,7 @@ def _recover_incomplete_downloads():
                 "downloaded": 0, "skipped": 0, "errors": 0, "total": 0,
                 "current_file": "",
                 "dest": f"{DOWNLOAD_DISPLAY}/{entry.name}",
-                "error_msg": error_msg, "keys": None,
+                "error_msg": error_msg, "keys": state["keys"] if state else None,
             })
         recovered += 1
 
@@ -792,9 +796,10 @@ def startup():
             with _lock:
                 count = len(_datasets)
             logger.info(f"[startup] Index ready: {count} bags")
-            _recover_incomplete_downloads()
         except Exception as e:
             logger.error(f"[startup] Index sync failed: {e}")
+        # State files allow disk recovery even while S3 is unavailable.
+        _recover_incomplete_downloads()
 
     threading.Thread(target=bg_init, daemon=True).start()
     threading.Thread(target=_dl_worker, daemon=True).start()
