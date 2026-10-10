@@ -5,22 +5,22 @@ Trims a downloaded ROS2 parquet dataset to a time window and rebuilds metadata.y
 so the result is playable with `ros2 bag play`. No ROS2 installation required.
 
 Pipeline:
-  1. Find which parquet files contain trim_start / trim_end timestamps
-  2. Slice the boundary files (keep only rows within the time window)
-  3. Inject one-shot topics (maps, tf_static, route, etc.) from _0.parquet into the start file
-  4. Leave intermediate files untouched
-  5. Remove out-of-range files
-  6. Regenerate metadata.yaml from actual parquet contents
+  1. Filter every sensor file to the inclusive time window
+  2. Preserve historical one-shot topics from category _0 files
+  3. Stage filtered files and regenerated metadata before replacing originals
+  4. Remove out-of-range files after successful staging
 """
 
 import logging
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 logger = logging.getLogger("trim_parquet")
@@ -77,9 +77,9 @@ def _list_data_parquets(dataset_dir: Path) -> list[Path]:
     files = []
     for f in dataset_dir.iterdir():
         m = pattern.search(f.name)
-        if m and "_topics" not in f.name:
+        if f.is_file() and m and "_topics" not in f.name:
             files.append((int(m.group(1)), f))
-    files.sort(key=lambda x: x[0])
+    files.sort(key=lambda x: (x[0], x[1].name))
     return [f for _, f in files]
 
 
@@ -109,15 +109,15 @@ def _read_table(path: Path) -> pa.Table:
 def _get_ts_range(table: pa.Table) -> tuple[int, int]:
     """Return (min_timestamp, max_timestamp) from a data parquet table."""
     ts = table.column("timestamp")
-    return ts[0].as_py(), ts[-1].as_py()
+    return pc.min(ts).as_py(), pc.max(ts).as_py()
 
 
 def _filter_by_timestamp(table: pa.Table, ts_start: int, ts_end: int) -> pa.Table:
     """Keep rows where ts_start <= timestamp <= ts_end."""
     ts = table.column("timestamp")
-    mask = pa.compute.and_(
-        pa.compute.greater_equal(ts, ts_start),
-        pa.compute.less_equal(ts, ts_end),
+    mask = pc.and_(
+        pc.greater_equal(ts, ts_start),
+        pc.less_equal(ts, ts_end),
     )
     return table.filter(mask)
 
@@ -155,129 +155,76 @@ def trim_bag(dataset_dir: str, trim_start_ns: int, trim_end_ns: int) -> dict:
     Returns:
         dict with stats: files_before, files_after, messages_total
     """
+    if trim_start_ns > trim_end_ns:
+        raise ValueError("Trim start must not be after trim end")
     bag_path = Path(dataset_dir)
     data_files = _list_data_parquets(bag_path)
-
     if not data_files:
-        logger.warning(f"[trim] No data parquets found in {dataset_dir}")
-        return {"error": "no data parquets"}
+        raise ValueError("No data parquets found")
 
     topics_path = _find_topics_parquet(bag_path)
     oneshot_ids = _get_oneshot_topic_ids(topics_path) if topics_path else set()
-
-    logger.info(
-        f"[trim] Trimming {dataset_dir}: {len(data_files)} files, "
-        f"window {trim_start_ns}-{trim_end_ns}, "
-        f"{len(oneshot_ids)} one-shot topic IDs"
-    )
-
-    # Classify files: before, start-boundary, middle, end-boundary, after
-    files_before = []    # entirely before window — delete
-    files_after = []     # entirely after window — delete
-    files_middle = []    # entirely within window — keep as-is
-    start_file = None    # contains trim_start — slice
-    end_file = None      # contains trim_end — slice
-    zero_file = data_files[0] if data_files else None
-
-    for f in data_files:
-        table = _read_table(f)
-        if len(table) == 0:
-            files_before.append(f)
-            continue
-        f_start, f_end = _get_ts_range(table)
-
-        if f_end < trim_start_ns:
-            files_before.append(f)
-        elif f_start > trim_end_ns:
-            files_after.append(f)
-        elif f_start < trim_start_ns and f_end >= trim_start_ns:
-            start_file = f
-        elif f_start <= trim_end_ns and f_end > trim_end_ns:
-            end_file = f
-        else:
-            files_middle.append(f)
-
-    # If start or end timestamp falls within a single file
-    if start_file and end_file and start_file == end_file:
-        end_file = None  # will handle both cuts in start_file
-
-    # Extract one-shot rows from _0.parquet (before deleting it)
-    oneshot_rows = None
-    if zero_file and oneshot_ids:
-        zero_table = _read_table(zero_file)
-        tid_col = zero_table.column("topic_id")
-        mask = pa.array([t.as_py() in oneshot_ids for t in tid_col])
-        oneshot_rows = zero_table.filter(mask)
-        if len(oneshot_rows) > 0:
-            # Set timestamps to just before trim_start so they sort first
-            n = len(oneshot_rows)
-            fake_ts = pa.array(
-                [trim_start_ns - n + i for i in range(n)],
-                type=pa.int64(),
+    historical = []
+    # Each sensor category can have its own _0 file. Preserve only historical
+    # context; messages already inside the requested window must not be copied.
+    for path in data_files:
+        if path.name.endswith("_0.parquet") and oneshot_ids:
+            table = _read_table(path)
+            mask = pc.and_(
+                pc.is_in(table.column("topic_id"), value_set=pa.array(
+                    sorted(oneshot_ids), type=pa.uint16())),
+                pc.less(table.column("timestamp"), trim_start_ns),
             )
-            oneshot_rows = oneshot_rows.set_column(
-                oneshot_rows.schema.get_field_index("timestamp"),
-                "timestamp",
-                fake_ts,
+            rows = table.filter(mask)
+            if len(rows):
+                historical.append(rows)
+
+    # Stage all output before changing originals. Invalid/corrupt input and
+    # an empty selection leave the downloaded dataset and metadata untouched.
+    with tempfile.TemporaryDirectory(prefix=".trim-", dir=bag_path) as tmp:
+        staging = Path(tmp)
+        retained = []
+        for path in data_files:
+            table = _filter_by_timestamp(_read_table(path), trim_start_ns, trim_end_ns)
+            if not len(table):
+                continue
+            table = table.sort_by([("timestamp", "ascending")])
+            _write_parquet(_reindex_ids(table), staging / path.name)
+            retained.append((table.column("timestamp")[0].as_py(), path.name))
+        if not retained:
+            raise ValueError("No messages in requested time window")
+
+        if historical:
+            _, first_name = min(retained)
+            context = pa.concat_tables(historical).sort_by([("timestamp", "ascending")])
+            count = len(context)
+            context = context.set_column(
+                context.schema.get_field_index("timestamp"), "timestamp",
+                pa.array(range(trim_start_ns - count, trim_start_ns), type=pa.int64()),
             )
-            logger.info(f"[trim] Extracted {n} one-shot rows from {zero_file.name}")
-        else:
-            oneshot_rows = None
+            first = _read_table(staging / first_name)
+            _write_parquet(_reindex_ids(pa.concat_tables([context, first])), staging / first_name)
 
-    # Process start file
-    if start_file:
-        table = _read_table(start_file)
-        if end_file is None and start_file not in files_middle:
-            # Both trim_start and trim_end are in this file
-            table = _filter_by_timestamp(table, trim_start_ns, trim_end_ns)
-        else:
-            table = _filter_by_timestamp(table, trim_start_ns, 2**62)
+        if topics_path:
+            shutil.copy2(topics_path, staging / topics_path.name)
+        result = reindex_metadata(staging)
+        if "error" in result:
+            raise ValueError(result["error"])
 
-        if oneshot_rows is not None and len(oneshot_rows) > 0:
-            table = pa.concat_tables([oneshot_rows, table])
-            oneshot_rows = None  # consumed
+        meta_path = bag_path / "metadata.yaml"
+        backup = bag_path / "metadata.yaml.orig"
+        if meta_path.exists() and not backup.exists():
+            shutil.copy2(meta_path, backup)
+        kept = {name for _, name in retained}
+        for path in data_files:
+            if path.name in kept:
+                os.replace(staging / path.name, path)
+            else:
+                path.unlink()
+        os.replace(staging / "metadata.yaml", meta_path)
 
-        table = _reindex_ids(table)
-        _write_parquet(table, start_file)
-        logger.info(f"[trim] Sliced start file {start_file.name}: {len(table)} rows")
-
-    # If no start_file but we have one-shot rows, inject into first middle file
-    if oneshot_rows is not None and len(oneshot_rows) > 0 and files_middle:
-        first_middle = files_middle[0]
-        table = _read_table(first_middle)
-        table = pa.concat_tables([oneshot_rows, table])
-        table = _reindex_ids(table)
-        _write_parquet(table, first_middle)
-        logger.info(f"[trim] Injected one-shot rows into {first_middle.name}")
-
-    # Process end file
-    if end_file:
-        table = _read_table(end_file)
-        table = _filter_by_timestamp(table, 0, trim_end_ns)
-        table = _reindex_ids(table)
-        _write_parquet(table, end_file)
-        logger.info(f"[trim] Sliced end file {end_file.name}: {len(table)} rows")
-
-    # Delete out-of-range files (but keep _0 if it's the start_file or middle)
-    keep_set = set()
-    if start_file:
-        keep_set.add(start_file)
-    if end_file:
-        keep_set.add(end_file)
-    keep_set.update(files_middle)
-
-    deleted = 0
-    for f in files_before + files_after:
-        if f not in keep_set:
-            f.unlink()
-            deleted += 1
-
-    logger.info(f"[trim] Deleted {deleted} out-of-range files")
-
-    # Reindex: regenerate metadata.yaml
-    result = reindex_metadata(bag_path)
     result["files_before"] = len(data_files)
-    result["files_deleted"] = deleted
+    result["files_deleted"] = len(data_files) - len(retained)
     return result
 
 
@@ -320,8 +267,8 @@ def reindex_metadata(dataset_dir: Path) -> dict:
             continue
 
         ts_col = table.column("timestamp")
-        f_min = ts_col[0].as_py()
-        f_max = ts_col[-1].as_py()
+        f_min = pc.min(ts_col).as_py()
+        f_max = pc.max(ts_col).as_py()
 
         if global_min_ts is None or f_min < global_min_ts:
             global_min_ts = f_min

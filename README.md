@@ -111,7 +111,7 @@ The index contains dataset metadata (filename, device_id, year/month/day) used f
 The `trim_parquet.py` module provides ROS2-independent trimming:
 
 - **No ROS2 required**: Pure PyArrow for reading/writing parquets
-- **Timestamp filtering**: Binary search to find boundary files
+- **Timestamp filtering**: Inclusive filtering of every selected sensor file, including overlapping time ranges
 - **One-shot preservation**: Extracts transient_local topics and prepends them
 - **Metadata regeneration**: Scans actual files to rebuild metadata.yaml
 - **Result**: Trimmed bag is immediately playable with `ros2 bag play`
@@ -186,7 +186,7 @@ systemctl --user restart datamanager
 - **Index caching**: The dataset index is cached in memory.
 - **Live S3 listing**: Dataset scans list files from S3; latency depends on storage and dataset size.
 - **Download worker**: A background thread processes the download queue; boto3 handles file transfers.
-- **Streaming trim**: Parquet trimming processes files sequentially, one at a time
+- **Staged trim**: Parquet trimming processes files sequentially and stages output before replacing source files; allow disk space for the filtered copy
 - **UI updates**: The frontend polls queue status every two seconds; downloads run in a background thread.
 
 ### Error Handling
@@ -246,3 +246,37 @@ This project demonstrates:
 ## License
 
 Demonstration project. Use for learning and interview preparation.
+
+## Backend validation
+
+Use Python 3.11 or newer. Tests create small real Parquet files in temporary
+folders and mock S3 calls; no credentials, MinIO, or ROS2 installation is needed.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions runs this suite on Python 3.11, 3.12, and 3.13.
+
+### Trimming and recovery guarantees
+
+- The trim window is inclusive. Every selected data file is filtered, even when
+  sensor categories overlap in time or rows arrive out of order.
+- Historical one-shot messages from category `_0.parquet` files are preserved
+  before the window. Messages already inside the window are not duplicated.
+- Filtered files and metadata are staged first. Invalid input, a staging error,
+  or a window with no messages leaves the original dataset unchanged.
+- Replacing the staged output is not a transaction across all files. A process
+  crash during replacement requires resuming the task; extra temporary disk
+  space is needed during trimming.
+- Task parameters and S3 keys are saved in `.download-state.json`, preserving
+  exact timestamps across a restart. `.download-complete.json` is written only
+  after successful post-processing and records output names and sizes.
+- Recovery validates this completion record. Missing/truncated output and
+  legacy folders without a record are shown as stopped, not assumed complete.
+  Size validation does not detect same-size content corruption.
+- Post-processing errors are reported as errors in the queue and do not mark
+  the dataset complete.
