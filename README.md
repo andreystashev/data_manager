@@ -29,7 +29,7 @@ Opens on http://localhost:8000
 - Download by sensor categories: lidars, cameras, radars, other
 - Time-based trimming with automatic metadata re-indexing
 - One-shot topics preservation (maps, tf_static, route) 
-- Download queue with pause/resume capability
+- Download queue with stop/resume capability
 - Automatic file renaming for ROS2 bag play compatibility
 - Resume incomplete downloads on restart
 
@@ -85,7 +85,7 @@ datamanager/
 ### S3 Storage Structure
 
 ```
-trino/
+demo-datasets/
 ├── datasets_index.json
 ├── datasets_topics/year=YYYY/month=MM/day=DD/device_id=XXXX/{dataset}_topics.parquet
 ├── datasets_meta/.../metadata.yaml
@@ -125,8 +125,16 @@ The `trim_parquet.py` module provides ROS2-independent trimming:
 | `/api/datasets/{name}/metadata` | GET | Get metadata.yaml (time hints) |
 | `/api/queue` | GET | Get download queue status |
 | `/api/queue` | POST | Add download task to queue |
-| `/api/queue/{id}/control` | POST | Pause/resume/stop task |
-| `/api/download/{id}` | GET | Stream downloaded file |
+| `/api/queue/{id}/stop` | POST | Stop a task |
+| `/api/queue/{id}/resume` | POST | Resume a stopped or failed task |
+| `/api/queue/{id}` | DELETE | Remove an inactive task |
+| `/api/queue/done` | DELETE | Remove completed tasks |
+| `/api/queue/rescan` | POST | Recover downloads from local folders |
+| `/api/download-path` | GET / PUT | Read or change the local download directory |
+| `/api/datasets/refresh` | POST | Refresh the dataset index |
+| `/api/health` | GET | Check backend and S3 status |
+
+Downloads are written to the configured local directory; the backend does not expose a dedicated file-download API.
 
 ### Frontend UI Features
 
@@ -169,22 +177,22 @@ systemctl --user restart datamanager
 
 1. **Single container simplicity** - Easy to deploy, minimal infrastructure
 2. **In-memory caching** - Fast listing with S3 fallback for missing datasets
-3. **Background worker** - Non-blocking downloads, graceful pause/resume
+3. **Background worker** - Non-blocking downloads, graceful stop/resume
 4. **PyArrow streaming** - Efficient parquet processing, no temp files for trimming
 5. **Metadata regeneration** - Ensures ROS2 compatibility after modifications
 
 ### Performance Considerations
 
-- **Index caching**: Startup scans `datasets_index.json` once (25-50ms)
-- **Live S3 listing**: Per-dataset scan cached after first request (1-3s depending on file count)
-- **Parallel downloads**: 5 concurrent S3 GetObject calls by default
+- **Index caching**: The dataset index is cached in memory.
+- **Live S3 listing**: Dataset scans list files from S3; latency depends on storage and dataset size.
+- **Download worker**: A background thread processes the download queue; boto3 handles file transfers.
 - **Streaming trim**: Parquet trimming processes files sequentially, one at a time
-- **UI responsiveness**: All backend work is async, WebSocket keeps frontend updated
+- **UI updates**: The frontend polls queue status every two seconds; downloads run in a background thread.
 
 ### Error Handling
 
 - **Resume on error**: Failed downloads marked with error count
-- **Timeout recovery**: Paused tasks can be resumed from last checkpoint
+- **Recovery**: Stopped or failed tasks can be resumed; local folders are scanned to recover incomplete downloads.
 - **Missing file handling**: Gracefully skip corrupted/deleted files
 - **Metadata fallback**: If fresh scan fails, use last known file list
 
@@ -199,8 +207,8 @@ python3 main_s3.py
 ```
 
 Environment variables:
-- `S3_ENDPOINT`: MinIO/S3 endpoint (default: http://192.168.1.42:9000)
-- `S3_BUCKET`: S3 bucket name (default: trino)
+- `S3_ENDPOINT`: MinIO/S3 endpoint (default: http://localhost:9000)
+- `S3_BUCKET`: S3 bucket name (default: demo-datasets)
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`: S3 credentials
 - `DOWNLOAD_BASE`: Base path for downloads
 - `DOWNLOAD_DISPLAY`: Display path in UI
@@ -220,7 +228,7 @@ Vite serves on http://localhost:5173 with hot reload.
 This project demonstrates:
 
 1. **Full-stack system design** for real-world data management
-2. **Async/await patterns** for responsive web interfaces
+2. **Background processing and HTTP polling** for responsive web interfaces
 3. **Efficient parquet handling** without heavy dependencies
 4. **Container-based deployment** for consistency
 5. **Resume/retry patterns** for robust background tasks
@@ -230,7 +238,7 @@ This project demonstrates:
 
 - Use S3 for scalable data storage, not local filesystems
 - Pre-compute indices for faster listing (datasets_index.json)
-- Support graceful pause/resume for long-running operations
+- Support graceful stop/resume for long-running operations
 - Validate metadata after modifications (metadata regeneration)
 - Provide debug visibility without exposing sensitive details
 - Design for offline-first where possible (in-memory cache)
