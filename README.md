@@ -280,3 +280,17 @@ GitHub Actions runs this suite on Python 3.11, 3.12, and 3.13.
   Size validation does not detect same-size content corruption.
 - Post-processing errors are reported as errors in the queue and do not mark
   the dataset complete.
+
+### Selecting sensor categories
+
+Category filtering preserves each selected sensor's numbered files, including
+`_cameras_0.parquet`, `_lidars_0.parquet`, and `_radars_0.parquet`. Auxiliary
+`_other_0.parquet` (or legacy `_0.parquet`) files contribute only recognized
+one-shot topics when `other` is disabled; their ordinary sensor rows are not
+included, even when they overlap the requested time window.
+
+One-shot messages inside the selected window retain their timestamps. Historical
+context is moved just before the window. Partial selections without a time cut
+preserve original timestamps and rebuild metadata from the resulting files.
+Category filtering requires a topics Parquet file; if it is missing, the task
+reports an error instead of deleting files without knowing their topic types.

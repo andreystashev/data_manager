@@ -96,7 +96,7 @@ class RecoveryTests(unittest.TestCase):
     def test_worker_marks_completion_only_after_success(self):
         server._queue.append({"id": 1, "dataset_name": self.name, "params": self.params,
                               "status": "pending", "keys": None})
-        def trim(*args):
+        def trim(*args, **kwargs):
             self.assertFalse(state.is_complete(self.folder))
             return {"messages_total": 1}
         with patch.object(server, "_resolve_keys", return_value=(self.keys, self.folder, "~/test")), \

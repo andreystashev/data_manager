@@ -143,7 +143,18 @@ def _write_parquet(table: pa.Table, path: Path):
     )
 
 
-def trim_bag(dataset_dir: str, trim_start_ns: int, trim_end_ns: int) -> dict:
+def _sensor_category(path: Path) -> str:
+    match = re.search(r"_(lidars|cameras|radars|other)_\d+\.parquet$", path.name)
+    return match.group(1) if match else "other"
+
+
+def select_sensor_categories(dataset_dir: str, categories: set[str]) -> dict:
+    """Filter categories without a time cut, preserving auxiliary one-shot topics."""
+    return trim_bag(dataset_dir, -(2**63), 2**63 - 1, selected_categories=categories)
+
+
+def trim_bag(dataset_dir: str, trim_start_ns: int, trim_end_ns: int,
+             *, selected_categories: Optional[set[str]] = None) -> dict:
     """
     Trim a parquet dataset in-place to the given nanosecond time window.
 
@@ -151,29 +162,41 @@ def trim_bag(dataset_dir: str, trim_start_ns: int, trim_end_ns: int) -> dict:
         dataset_dir: Path to the downloaded dataset folder
         trim_start_ns: Start timestamp in nanoseconds since epoch
         trim_end_ns: End timestamp in nanoseconds since epoch
+        selected_categories: Optional sensor categories to retain; auxiliary _0
+            files contribute only one-shot messages, never ordinary sensor rows.
 
     Returns:
         dict with stats: files_before, files_after, messages_total
     """
     if trim_start_ns > trim_end_ns:
         raise ValueError("Trim start must not be after trim end")
+    if selected_categories is not None:
+        selected_categories = set(selected_categories)
+        if not selected_categories or not selected_categories <= {"lidars", "cameras", "radars", "other"}:
+            raise ValueError("Select at least one valid sensor category")
     bag_path = Path(dataset_dir)
     data_files = _list_data_parquets(bag_path)
     if not data_files:
         raise ValueError("No data parquets found")
 
     topics_path = _find_topics_parquet(bag_path)
+    if selected_categories is not None and not topics_path:
+        raise ValueError("Topics parquet is required to filter sensor categories")
     oneshot_ids = _get_oneshot_topic_ids(topics_path) if topics_path else set()
     historical = []
     # Each sensor category can have its own _0 file. Preserve only historical
-    # context; messages already inside the requested window must not be copied.
+    # context from selected files. Auxiliary files also supply in-window
+    # one-shot messages, since their ordinary rows will be excluded.
     for path in data_files:
         if path.name.endswith("_0.parquet") and oneshot_ids:
             table = _read_table(path)
+            auxiliary = (selected_categories is not None
+                         and _sensor_category(path) not in selected_categories)
+            time_mask = (pc.less_equal(table.column("timestamp"), trim_end_ns) if auxiliary
+                         else pc.less(table.column("timestamp"), trim_start_ns))
             mask = pc.and_(
                 pc.is_in(table.column("topic_id"), value_set=pa.array(
-                    sorted(oneshot_ids), type=pa.uint16())),
-                pc.less(table.column("timestamp"), trim_start_ns),
+                    sorted(oneshot_ids), type=pa.uint16())), time_mask,
             )
             rows = table.filter(mask)
             if len(rows):
@@ -185,6 +208,8 @@ def trim_bag(dataset_dir: str, trim_start_ns: int, trim_end_ns: int) -> dict:
         staging = Path(tmp)
         retained = []
         for path in data_files:
+            if selected_categories is not None and _sensor_category(path) not in selected_categories:
+                continue
             table = _filter_by_timestamp(_read_table(path), trim_start_ns, trim_end_ns)
             if not len(table):
                 continue
@@ -197,13 +222,18 @@ def trim_bag(dataset_dir: str, trim_start_ns: int, trim_end_ns: int) -> dict:
         if historical:
             _, first_name = min(retained)
             context = pa.concat_tables(historical).sort_by([("timestamp", "ascending")])
-            count = len(context)
+            timestamps = context.column("timestamp").to_pylist()
+            historical_count = sum(ts < trim_start_ns for ts in timestamps)
+            # Keep in-window auxiliary messages at their real timestamps.
+            # Only historical context is moved immediately before the window.
+            timestamps[:historical_count] = range(trim_start_ns - historical_count, trim_start_ns)
             context = context.set_column(
                 context.schema.get_field_index("timestamp"), "timestamp",
-                pa.array(range(trim_start_ns - count, trim_start_ns), type=pa.int64()),
+                pa.array(timestamps, type=pa.int64()),
             )
             first = _read_table(staging / first_name)
-            _write_parquet(_reindex_ids(pa.concat_tables([context, first])), staging / first_name)
+            merged = pa.concat_tables([context, first]).sort_by([("timestamp", "ascending")])
+            _write_parquet(_reindex_ids(merged), staging / first_name)
 
         if topics_path:
             shutil.copy2(topics_path, staging / topics_path.name)
