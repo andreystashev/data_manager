@@ -32,6 +32,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
+      INIT_DEMO_DATA: ${INIT_DEMO_DATA:-1}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
       S3_BUCKET: ${S3_BUCKET:-demo-datasets}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}

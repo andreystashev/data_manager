@@ -15,7 +15,8 @@ Opens on http://localhost:8000
 ## Requirements
 
 - Docker + Docker Compose
-- `~/.aws/credentials` with MinIO keys:
+- The built-in MinIO demo uses the credentials in Compose; no AWS credentials file is needed.
+- For external storage, configure credentials through environment variables or `~/.aws/credentials`:
   ```ini
   [default]
   aws_access_key_id = ...
@@ -294,3 +295,31 @@ context is moved just before the window. Partial selections without a time cut
 preserve original timestamps and rebuild metadata from the resulting files.
 Category filtering requires a topics Parquet file; if it is missing, the task
 reports an error instead of deleting files without knowing their topic types.
+
+### Built-in demo data
+
+The default Compose setup seeds the `demo-datasets` MinIO bucket with small,
+deterministic Parquet tables. Each sensor file contains 128 synthetic rows;
+`other_0` also includes `/tf_static`, map and route context. All sensor categories
+cover the same dataset time span, and metadata is derived from actual table rows.
+Payloads are JSON examples, **not real ROS2 CDR messages**: the demo exercises
+browsing, category selection, downloads, trimming and metadata, not ROS2 playback.
+
+Demo seeding skips an existing dataset index and never seeds a custom bucket.
+For your own S3 storage, disable initialization explicitly:
+
+```bash
+INIT_DEMO_DATA=0 docker compose up --build -d
+```
+
+A standalone container also defaults to disabled initialization. Compose enables
+it for the local demo. The dataset index is uploaded after all demo files.
+To deliberately replace old placeholder objects in the dedicated demo bucket:
+
+```bash
+docker compose exec datamanager python init_minio.py --refresh-demo
+```
+
+This refresh overwrites demo objects and the demo index. It is never automatic.
+Existing local downloads are not refreshed by that command; use an empty local
+download folder to try the new demo data.

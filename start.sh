@@ -50,8 +50,6 @@ if [ "$1" = "--no-autostart" ]; then
     exit 0
 fi
 
-[ ! -f ~/.aws/credentials ] && echo "WARNING: ~/.aws/credentials not found"
-
 echo "Starting DataManager (UID=$DOCKER_UID)..."
 docker compose down 2>/dev/null || true
 docker compose up --build -d
