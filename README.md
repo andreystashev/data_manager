@@ -1,6 +1,6 @@
 # Data Manager
 
-[![Backend tests](https://github.com/andreystashev/data_manager/actions/workflows/tests.yml/badge.svg)](https://github.com/andreystashev/data_manager/actions/workflows/tests.yml)
+[![Backend tests](https://github.com/andreystashev/sensor-data-manager/actions/workflows/tests.yml/badge.svg)](https://github.com/andreystashev/sensor-data-manager/actions/workflows/tests.yml)
 
 A **FastAPI and React** application for browsing sensor datasets in **MinIO/S3**, downloading selected sensor categories, and trimming Parquet messages to a time window. It rebuilds ROS2-style metadata and preserves recognized one-shot context such as maps, routes, and static transforms.
 
@@ -25,8 +25,8 @@ The repository includes a small synthetic demo so the download and filtering wor
 Requirements: **Docker Engine/Desktop, Compose v2, and Bash**. The default Compose file includes Linux timezone mounts; on macOS, remove the `/etc/localtime` and `/etc/timezone` mounts if Docker cannot mount them.
 
 ```bash
-git clone https://github.com/andreystashev/data_manager.git
-cd data_manager
+git clone https://github.com/andreystashev/sensor-data-manager.git
+cd sensor-data-manager
 ./start.sh
 ```
 
